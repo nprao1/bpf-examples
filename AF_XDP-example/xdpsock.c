@@ -654,16 +654,31 @@ static void xdpsock_cleanup(void)
 		remove_xdp_program();
 }
 
+/* Cached swapped MAC addresses for fast L2 forwarding */
+static bool mac_cache_valid;
+static unsigned char swapped_macs[12];  /* dst MAC (6 bytes) + src MAC (6 bytes) */
+
 static void swap_mac_addresses(void *data)
 {
 	struct ether_header *eth = (struct ether_header *)data;
-	struct ether_addr *src_addr = (struct ether_addr *)&eth->ether_shost;
-	struct ether_addr *dst_addr = (struct ether_addr *)&eth->ether_dhost;
-	struct ether_addr tmp;
 
-	tmp = *src_addr;
-	*src_addr = *dst_addr;
-	*dst_addr = tmp;
+	if (!mac_cache_valid) {
+		/* First packet - read, swap, and cache */
+		struct ether_addr *src_addr = (struct ether_addr *)&eth->ether_shost;
+		struct ether_addr *dst_addr = (struct ether_addr *)&eth->ether_dhost;
+		struct ether_addr tmp;
+
+		tmp = *src_addr;
+		*src_addr = *dst_addr;
+		*dst_addr = tmp;
+
+		/* Cache the swapped result */
+		memcpy(swapped_macs, eth, 12);
+		mac_cache_valid = true;
+	} else {
+		/* Subsequent packets - just write cached swapped MACs */
+		memcpy(eth, swapped_macs, 12);
+	}
 }
 
 static void hex_dump(void *pkt, size_t length, u64 addr)
