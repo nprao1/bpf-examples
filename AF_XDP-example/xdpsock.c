@@ -1776,7 +1776,6 @@ static void l2fwd(struct xsk_socket_info *xsk)
 {
 	u32 idx_rx = 0, idx_tx = 0, frags_done = 0;
 	unsigned int rcvd, i, eop_cnt = 0;
-	static u32 nb_frags;
 	int ret;
 
 	complete_tx_l2fwd(xsk);
@@ -1812,7 +1811,7 @@ static void l2fwd(struct xsk_socket_info *xsk)
 		addr = xsk_umem__add_offset_to_addr(addr);
 		char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 
-		if (!nb_frags++)
+		if (!xsk->nb_frags++)
 			swap_mac_addresses(pkt);
 
 		hex_dump(pkt, len, addr);
@@ -1824,8 +1823,8 @@ static void l2fwd(struct xsk_socket_info *xsk)
 		tx_desc->len = len;
 
 		if (eop) {
-			frags_done += nb_frags;
-			nb_frags = 0;
+			frags_done += xsk->nb_frags;
+			xsk->nb_frags = 0;
 			eop_cnt++;
 		}
 	}
