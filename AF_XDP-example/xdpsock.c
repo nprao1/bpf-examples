@@ -635,13 +635,13 @@ static void __exit_with_error(int error, const char *file, const char *func,
 
 static void xdpsock_cleanup(void)
 {
-	struct xsk_umem *umem = xsks[0]->umem->umem;
 	int i, cmd = CLOSE_CONN;
 
 	dump_stats();
-	for (i = 0; i < num_socks; i++)
+	for (i = 0; i < num_socks; i++) {
 		xsk_socket__delete(xsks[i]->xsk);
-	(void)xsk_umem__delete(umem);
+		(void)xsk_umem__delete(xsks[i]->umem->umem);
+	}
 
 	if (opt_reduced_cap) {
 		if (write(sock, &cmd, sizeof(int)) < 0)
@@ -2028,7 +2028,6 @@ int main(int argc, char **argv)
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
 	bool rx = false, tx = false;
 	struct sched_param schparam;
-	struct xsk_umem_info *umem;
 	int xsks_map_fd = 0;
 	pthread_t pt;
 	int i, ret;
@@ -2065,38 +2064,56 @@ int main(int argc, char **argv)
 			load_xdp_program();
 	}
 
-	/* Reserve memory for the umem. Use hugepages if unaligned chunk mode */
-	bufs = mmap(NULL, NUM_FRAMES * opt_xsk_frame_size,
-		    PROT_READ | PROT_WRITE,
-		    MAP_PRIVATE | MAP_ANONYMOUS | opt_mmap_flags, -1, 0);
-	if (bufs == MAP_FAILED) {
-		printf("ERROR: mmap failed\n");
-		exit(EXIT_FAILURE);
-	}
-
-	/* Create sockets... */
-	umem = xsk_configure_umem(bufs, NUM_FRAMES * opt_xsk_frame_size);
-	if (opt_bench == BENCH_RXDROP || opt_bench == BENCH_L2FWD) {
+	/* Create per-queue UMEMs and sockets */
+	if (opt_bench == BENCH_RXDROP || opt_bench == BENCH_L2FWD)
 		rx = true;
-		xsk_populate_fill_ring(umem);
-	}
 	if (opt_bench == BENCH_L2FWD || opt_bench == BENCH_TXONLY)
 		tx = true;
-	for (i = 0; i < opt_num_xsks; i++)
-		xsks[num_socks++] = xsk_configure_socket(umem, rx, tx, opt_queue);
+
+	if (opt_bench == BENCH_TXONLY && opt_tstamp && opt_pkt_size < PKTGEN_SIZE_MIN)
+		opt_pkt_size = PKTGEN_SIZE_MIN;
+
+	if (opt_bench == BENCH_TXONLY)
+		gen_eth_hdr_data();
+
+	for (i = 0; i < opt_num_xsks; i++) {
+		struct xsk_umem_info *umem;
+		int queue_id = opt_queue + i;
+
+		printf("Creating socket for queue %d (rx=%d, tx=%d, opt_num_xsks=%d)\n",
+		       queue_id, rx, tx, opt_num_xsks);
+
+		bufs = mmap(NULL, NUM_FRAMES * opt_xsk_frame_size,
+			    PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS | opt_mmap_flags, -1, 0);
+		if (bufs == MAP_FAILED) {
+			printf("ERROR: mmap failed for queue %d\n", queue_id);
+			exit(EXIT_FAILURE);
+		}
+
+		umem = xsk_configure_umem(bufs, NUM_FRAMES * opt_xsk_frame_size);
+
+		if (rx)
+			xsk_populate_fill_ring(umem);
+
+		xsks[num_socks] = xsk_configure_socket(umem, rx, tx, queue_id);
+		if (!xsks[num_socks]) {
+			printf("ERROR: xsk_configure_socket returned NULL for queue %d\n", queue_id);
+			exit(EXIT_FAILURE);
+		}
+		xsks[num_socks]->thread_id = i;
+		num_socks++;
+
+		if (opt_bench == BENCH_TXONLY) {
+			int j;
+
+			for (j = 0; j < NUM_FRAMES; j++)
+				gen_eth_frame(umem, j * opt_xsk_frame_size);
+		}
+	}
 
 	for (i = 0; i < opt_num_xsks; i++)
 		apply_setsockopt(xsks[i]);
-
-	if (opt_bench == BENCH_TXONLY) {
-		if (opt_tstamp && opt_pkt_size < PKTGEN_SIZE_MIN)
-			opt_pkt_size = PKTGEN_SIZE_MIN;
-
-		gen_eth_hdr_data();
-
-		for (i = 0; i < NUM_FRAMES; i++)
-			gen_eth_frame(umem, i * opt_xsk_frame_size);
-	}
 	frames_per_pkt = (opt_pkt_size - 1) / XSK_UMEM__DEFAULT_FRAME_SIZE + 1;
 
 	if (load_xdp_prog && opt_bench != BENCH_TXONLY)
@@ -2157,7 +2174,8 @@ out:
 
 	xdpsock_cleanup();
 
-	munmap(bufs, NUM_FRAMES * opt_xsk_frame_size);
+	for (i = 0; i < num_socks; i++)
+		munmap(xsks[i]->umem->buffer, NUM_FRAMES * opt_xsk_frame_size);
 
 	return 0;
 }
