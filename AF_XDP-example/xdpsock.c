@@ -219,7 +219,10 @@ struct xsk_socket_info {
 	struct xsk_app_stats app_stats;
 	struct xsk_driver_stats drv_stats;
 	u32 outstanding_tx;
-};
+	int queue_id;		/* Assigned queue number */
+	int thread_id;		/* Thread index for this socket */
+	u32 nb_frags;		/* Multi-buffer fragment counter for l2fwd */
+} __attribute__((aligned(64)));	/* Cache-line align for per-thread stats */
 
 static const struct clockid_map {
 	const char *name;
@@ -1035,7 +1038,7 @@ static void xsk_populate_fill_ring(struct xsk_umem_info *umem)
 }
 
 static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
-						    bool rx, bool tx)
+						    bool rx, bool tx, int queue_id)
 {
 	struct xsk_socket_config cfg;
 	struct xsk_socket_info *xsk;
@@ -1048,6 +1051,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 		exit_with_error(errno);
 
 	xsk->umem = umem;
+	xsk->queue_id = queue_id;
 	cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
 	cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
 	if (load_xdp_prog || opt_reduced_cap)
@@ -1062,7 +1066,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 
 	rxr = rx ? &xsk->rx : NULL;
 	txr = tx ? &xsk->tx : NULL;
-	ret = xsk_socket__create(&xsk->xsk, opt_if, opt_queue, umem->umem,
+	ret = xsk_socket__create(&xsk->xsk, opt_if, queue_id, umem->umem,
 				 rxr, txr, &cfg);
 	if (ret)
 		exit_with_error(-ret);
@@ -2076,7 +2080,7 @@ int main(int argc, char **argv)
 	if (opt_bench == BENCH_L2FWD || opt_bench == BENCH_TXONLY)
 		tx = true;
 	for (i = 0; i < opt_num_xsks; i++)
-		xsks[num_socks++] = xsk_configure_socket(umem, rx, tx);
+		xsks[num_socks++] = xsk_configure_socket(umem, rx, tx, opt_queue);
 
 	for (i = 0; i < opt_num_xsks; i++)
 		apply_setsockopt(xsks[i]);
