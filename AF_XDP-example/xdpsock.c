@@ -1919,10 +1919,13 @@ static void enter_xsks_into_map(void)
 		int fd = xsk_socket__fd(xsks[i]->xsk);
 		int ret;
 
-		key = i;
+		/* Use queue_id as map key so BPF program can redirect
+		 * based on ctx->rx_queue_index
+		 */
+		key = xsks[i]->queue_id;
 		ret = bpf_map_update_elem(xsks_map, &key, &fd, 0);
 		if (ret) {
-			fprintf(stderr, "ERROR: bpf_map_update_elem %d\n", i);
+			fprintf(stderr, "ERROR: bpf_map_update_elem queue_id=%d\n", key);
 			exit(EXIT_FAILURE);
 		}
 	}
