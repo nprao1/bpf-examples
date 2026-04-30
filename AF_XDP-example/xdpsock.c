@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright(c) 2017 - 2022 Intel Corporation. */
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <getopt.h>
 #include <libgen.h>
@@ -101,7 +102,7 @@ static enum benchmark_type opt_bench = BENCH_RXDROP;
 static enum xdp_attach_mode opt_attach_mode = XDP_MODE_NATIVE;
 static const char *opt_if = "";
 static int opt_ifindex;
-static int opt_queue;
+static int opt_queue = 1;
 static unsigned long opt_duration;
 static unsigned long start_time;
 static bool benchmark_done;
@@ -246,6 +247,7 @@ static const struct sched_map {
 
 static int num_socks;
 struct xsk_socket_info *xsks[MAX_SOCKS];
+static pthread_t worker_threads[MAX_SOCKS];
 int sock;
 
 static int get_clockid(clockid_t *id, const char *name)
@@ -1124,6 +1126,7 @@ static struct option long_options[] = {
 	{"irq-string", no_argument, 0, 'I'},
 	{"busy-poll", no_argument, 0, 'B'},
 	{"reduce-cap", no_argument, 0, 'R'},
+	{"num-queues", required_argument, 0, 'D'},
 	{0, 0, 0, 0}
 };
 
@@ -1136,7 +1139,7 @@ static void usage(const char *prog)
 		"  -t, --txonly		Only send packets\n"
 		"  -l, --l2fwd		MAC swap L2 forwarding\n"
 		"  -i, --interface=n	Run on interface n\n"
-		"  -q, --queue=n	Use queue n (default 0)\n"
+		"  -q, --queue=n	Use queue n as starting queue (default 1)\n"
 		"  -p, --poll		Use poll syscall\n"
 		"  -S, --xdp-skb=n	Use XDP skb-mod\n"
 		"  -N, --xdp-native=n	Enforce XDP native mode\n"
@@ -1175,6 +1178,7 @@ static void usage(const char *prog)
 		"  -B, --busy-poll      Busy poll.\n"
 		"  -R, --reduce-cap	Use reduced capabilities (cannot be used with -M)\n"
 		"  -F, --frags		Enable frags (multi-buffer) support\n"
+		"  -D, --num-queues=n   Use N queues starting from -q (default 1, max 64)\n"
 		"\n";
 	fprintf(stderr, str, prog, XSK_UMEM__DEFAULT_FRAME_SIZE,
 		opt_batch_size, MIN_PKT_SIZE, MIN_PKT_SIZE,
@@ -1193,7 +1197,7 @@ static void parse_command_line(int argc, char **argv)
 
 	for (;;) {
 		c = getopt_long(argc, argv,
-				"rtli:q:pSNn:w:O:czf:muMd:b:C:s:P:VJ:K:G:H:T:yW:U:xQaI:BRF",
+				"rtli:q:pSNn:w:O:czf:muMd:b:C:s:P:VJ:K:G:H:T:yW:U:xQaI:BRFD:",
 				long_options, &option_index);
 		if (c == -1)
 			break;
@@ -1348,6 +1352,18 @@ static void parse_command_line(int argc, char **argv)
 			break;
 		case 'R':
 			opt_reduced_cap = true;
+			break;
+		case 'D':
+			opt_num_xsks = atoi(optarg);
+			if (opt_num_xsks <= 0) {
+				fprintf(stderr, "ERROR: num-queues must be > 0\n");
+				usage(basename(argv[0]));
+			}
+			if (opt_num_xsks > MAX_SOCKS) {
+				fprintf(stderr, "ERROR: max queues is %d, requested %d\n",
+					MAX_SOCKS, opt_num_xsks);
+				usage(basename(argv[0]));
+			}
 			break;
 		case 'F':
 			opt_frags = true;
@@ -1507,6 +1523,28 @@ static void rx_drop(struct xsk_socket_info *xsk)
 	xsk_ring_cons__release(&xsk->rx, rcvd);
 	xsk->ring_stats.rx_npkts += eop_cnt;
 	xsk->ring_stats.rx_frags += rcvd;
+}
+
+struct worker_thread_args {
+	struct xsk_socket_info *xsk;
+	int cpu_id;
+};
+
+static void setup_worker_affinity(int cpu_id, int queue_id)
+{
+	cpu_set_t cpuset;
+	char thread_name[16];
+	int ret;
+
+	CPU_ZERO(&cpuset);
+	CPU_SET(cpu_id, &cpuset);
+	ret = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+	if (ret)
+		fprintf(stderr, "Failed to set CPU affinity for queue %d to CPU %d: %s\n",
+			queue_id, cpu_id, strerror(ret));
+
+	snprintf(thread_name, sizeof(thread_name), "xsk_q%d", queue_id);
+	pthread_setname_np(pthread_self(), thread_name);
 }
 
 static void rx_drop_all(void)
@@ -1810,6 +1848,52 @@ static void l2fwd_all(void)
 		if (benchmark_done)
 			break;
 	}
+}
+
+static void *worker_thread_rxdrop(void *arg)
+{
+	struct worker_thread_args *args = (struct worker_thread_args *)arg;
+	struct xsk_socket_info *xsk = args->xsk;
+
+	setup_worker_affinity(args->cpu_id, xsk->queue_id);
+
+	while (!benchmark_done) {
+		if (opt_poll) {
+			struct pollfd fds[1];
+
+			fds[0].fd = xsk_socket__fd(xsk->xsk);
+			fds[0].events = POLLIN;
+			xsk->app_stats.opt_polls++;
+			poll(fds, 1, opt_timeout);
+		}
+
+		rx_drop(xsk);
+	}
+
+	return NULL;
+}
+
+static void *worker_thread_l2fwd(void *arg)
+{
+	struct worker_thread_args *args = (struct worker_thread_args *)arg;
+	struct xsk_socket_info *xsk = args->xsk;
+
+	setup_worker_affinity(args->cpu_id, xsk->queue_id);
+
+	while (!benchmark_done) {
+		if (opt_poll) {
+			struct pollfd fds[1];
+
+			fds[0].fd = xsk_socket__fd(xsk->xsk);
+			fds[0].events = POLLOUT | POLLIN;
+			xsk->app_stats.opt_polls++;
+			poll(fds, 1, opt_timeout);
+		}
+
+		l2fwd(xsk);
+	}
+
+	return NULL;
 }
 
 static void load_xdp_program(void)
@@ -2159,12 +2243,44 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	if (opt_bench == BENCH_RXDROP)
-		rx_drop_all();
-	else if (opt_bench == BENCH_TXONLY)
-		tx_only_all();
-	else
-		l2fwd_all();
+	if (opt_num_xsks > 1) {
+		/* Multi-queue mode: one thread per queue */
+		struct worker_thread_args thread_args[MAX_SOCKS];
+		void *(*worker_fn)(void *);
+
+		if (opt_bench == BENCH_RXDROP)
+			worker_fn = worker_thread_rxdrop;
+		else if (opt_bench == BENCH_TXONLY) {
+			fprintf(stderr, "ERROR: txonly not supported in multi-queue mode\n");
+			goto out;
+		} else
+			worker_fn = worker_thread_l2fwd;
+
+		for (i = 0; i < num_socks; i++) {
+			int cpu_id = opt_queue + i;
+
+			thread_args[i].xsk = xsks[i];
+			thread_args[i].cpu_id = cpu_id;
+
+			ret = pthread_create(&worker_threads[i], NULL, worker_fn, &thread_args[i]);
+			if (ret) {
+				fprintf(stderr, "Failed to create thread for queue %d: %s\n",
+					i, strerror(ret));
+				goto out;
+			}
+		}
+
+		for (i = 0; i < num_socks; i++)
+			pthread_join(worker_threads[i], NULL);
+	} else {
+		/* Single-queue mode: use existing poll-based functions */
+		if (opt_bench == BENCH_RXDROP)
+			rx_drop_all();
+		else if (opt_bench == BENCH_TXONLY)
+			tx_only_all();
+		else
+			l2fwd_all();
+	}
 
 out:
 	benchmark_done = true;
